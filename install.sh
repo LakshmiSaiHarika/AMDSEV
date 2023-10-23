@@ -4,18 +4,19 @@
 
 # This will install all the dependent packages for qemu and ovmf to run
 if [ "$ID" = "debian" ] || [ "$ID_LIKE" = "debian" ]; then
-	apt-get -y install qemu ovmf
+	sudo apt-get -y install qemu ovmf
 else
-	dnf install @virt edk2-ovmf -y
+	# qemu package do not exist in RedHat, qemu-kvm exist both in RedHat and Fedora
+	sudo dnf install qemu-kvm edk2-ovmf -y
 fi
 
 if [ "$ID" = "debian" ] || [ "$ID_LIKE" = "debian" ]; then
-	dpkg -i linux/host/linux-image-*.deb
+	sudo dpkg -i linux/host/linux-image-*.deb
 else
-	dnf install -y linux/host/kernel-*.rpm
+	sudo dnf install -y linux/host/kernel-*.rpm
 fi
 
-cp kvm.conf /etc/modprobe.d/
+sudo cp kvm.conf /etc/modprobe.d/
 
 echo
 echo "Reboot the host and select the SNP Host kernel"
