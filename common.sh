@@ -181,6 +181,13 @@ build_install_qemu()
 		popd >/dev/null
 	fi
 
+	# Fedora fix: Fix issue for FAILED: libqemuutil.a.p/util_async.c.o 
+  	[ -e /etc/os-release ] && . /etc/os-release
+	ID=${ID,,}
+	if [[ $ID -eq "fedora" ]]; then
+		wget "https://raw.githubusercontent.com/qemu/qemu/d66ba6dc1cce914673bd8a89fca30a7715ea70d1/util/async.c" -O "./qemu/util/async.c"
+  	fi
+
 	MAKE="make -j $(getconf _NPROCESSORS_ONLN) LOCALVERSION="
 
 	pushd qemu >/dev/null
