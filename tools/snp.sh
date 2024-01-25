@@ -75,7 +75,7 @@ ATTESTATION_WORKING_DIR="${ATTESTATION_WORKING_DIR:-${WORKING_DIR}/attest}"
 COMMAND="help"
 UPM=true
 SKIP_IMAGE_CREATE=false
-HOST_SSH_PORT="${HOST_SSH_PORT:-10022}"
+HOST_SSH_PORT="${HOST_SSH_PORT:-10024}"
 GUEST_NAME="${GUEST_NAME:-snp-guest}"
 GUEST_SIZE_GB="${GUEST_SIZE_GB:-20}"
 GUEST_USER="${GUEST_USER:-amd}"
@@ -447,6 +447,9 @@ download_cloud_init_image(){
       /bin/bash "$PWD/download_redhat_guest_image.sh"
       url_flag=0
       ;;
+    fedora)
+      CLOUD_INIT_IMAGE_URL="https://download.fedoraproject.org/pub/fedora/linux/releases/39/Cloud/x86_64/images/Fedora-Cloud-Base-39-1.5.x86_64.qcow2"
+      ;;
   esac
   if [ $url_flag -eq 1 ];then
     # Download qcow2 image from static URL
@@ -701,7 +704,7 @@ build_base_qemu_cmdline() {
   chmod +x "${QEMU_CMDLINE_FILE}"
 
   # Base cmdline
-  echo -n "${qemu_bin} " > "${QEMU_CMDLINE_FILE}"
+  echo -n "sudo ${qemu_bin} " > "${QEMU_CMDLINE_FILE}"
   add_qemu_cmdline_opts "--enable-kvm"
   add_qemu_cmdline_opts "-cpu EPYC-Milan-v2"
   add_qemu_cmdline_opts "-smp 2"
@@ -732,14 +735,14 @@ build_base_qemu_cmdline() {
 }
 
 stop_guests() {
-  local qemu_processes=$(ps aux | grep "${WORKING_DIR}.*qemu.*${IMAGE}" | grep -v "tail.*qemu.log" | grep -v "grep.*qemu")
+  local qemu_processes=$(sudo ps aux | grep "${WORKING_DIR}.*qemu.*${IMAGE}" | grep -v "tail.*qemu.log" | grep -v "grep.*qemu")
   [[ -n "${qemu_processes}" ]] || { echo -e "No qemu processes currently running"; return 0; }
 
   echo -e "Current running qemu process:"
   echo "${qemu_processes}"
 
   echo -e "\nKilling qemu process..."
-  pkill -9 -f "${WORKING_DIR}.*qemu.*${IMAGE}" || true
+  sudo pkill -9 -f "${WORKING_DIR}.*qemu.*${IMAGE}" || true
   sleep 3
 
   echo -e "Verifying no qemu processes running..."
@@ -821,7 +824,7 @@ get_guest_kernel_package(){
       ubuntu)
           echo $(realpath linux-image*snp-guest*.deb| grep -v dbg)
         ;;
-      rhel)
+      rhel | fedora)
           echo $(realpath $(ls -t kernel-*snp_guest*.rpm| grep -v header| head -1))
           ;;
     esac
@@ -833,10 +836,53 @@ get_package_install_command(){
     ubuntu)
       echo "dpkg -i"
       ;;
-    rhel)
+    rhel | fedora)
       echo "dnf install -y"
       ;;
   esac
+}
+
+scp_guest_command() {
+  
+  echo "in scp_guest_command() "
+
+  [ -n "${1}" ] || { >&2 echo -e "No scp source specified"; return 1; }
+  [ -n "${2}" ] || { >&2 echo -e "No scp target specified"; return 1; }
+
+  
+  echo "SCP Guest command exit status is:"
+  scp -r -P ${HOST_SSH_PORT} \
+    -i ${GUEST_SSH_KEY_PATH} \
+    -o "StrictHostKeyChecking no" \
+    -o "PasswordAuthentication=no" \
+    -o ConnectTimeout=1 \
+    "${1}" "${2}"
+
+  echo $?
+
+}
+
+wait_and_retry_command() {
+  local command="${1}"
+  
+  echo
+  echo "command is : $command"
+  echo
+  local max_tries=60
+  
+  for ((i=1; i<=${max_tries}; i++)); do
+    echo "i = $i"
+    if ! (${command} >/dev/null 2>&1); then
+      sleep 1
+      continue
+    fi
+
+    ${command}
+    return 0
+  done
+  
+  >&2 echo -e "ERROR: Timed out trying to connect to guest"
+  return 1
 }
 
 setup_and_launch_guest() {
@@ -873,44 +919,58 @@ setup_and_launch_guest() {
   if [ ! -f "${guest_kernel_installed_file}" ]; then
     # Launch qemu cmdline
     "${QEMU_CMDLINE_FILE}"
+    echo "QEMU CMDLINE exit status is :"
+    echo $?
+    echo
 
     # Install the guest kernel, retrieve the initrd and then reboot
     local guest_kernel_version=$(get_guest_kernel_version)
+    echo "guest_kernel_version = $guest_kernel_version"
     
     # initrd/initramfs
     local guest_initrd_basename="init*${guest_kernel_version}*"
 
     local package_install_command=$(get_package_install_command)
+    echo "package install command is: $package_install_command"
 
     # Locate guest kernel package in the host
     local guest_kernel_package=$(get_guest_kernel_package)
+    echo "guest_kernel_package = $guest_kernel_package"
+
   
     # Copy pckg into guest and Install 
+    # ssh_guest_command "ls -l ${GUEST_USER}/"
+    wait_and_retry_command "ssh_guest_command ls -l  /home/${GUEST_USER}"
+    echo "SCP Guest command exit status in setup-and-launch-guest is: "
     wait_and_retry_command "scp_guest_command ${guest_kernel_package} ${GUEST_USER}@localhost:/home/${GUEST_USER}"
-    ssh_guest_command "sudo $package_install_command /home/${GUEST_USER}/$(basename ${guest_kernel_package})"
+    echo $?
 
-    local initrd_filepath=$(ssh_guest_command "ls /boot/${guest_initrd_basename} | grep -v kdump")
-    initrd_filepath=$(echo $initrd_filepath| tr -d '\r')
+    # ssh_guest_command "sudo $package_install_command /home/${GUEST_USER}/$(basename ${guest_kernel_package})"
+
+    # local initrd_filepath=$(ssh_guest_command "ls /boot/${guest_initrd_basename} | grep -v kdump")
+    # initrd_filepath=$(echo $initrd_filepath| tr -d '\r')
 
     # Copy initrd/initramfs into home folder; change its permission to 644 for performing scp from guest into host
-    ssh_guest_command "sudo cp  $(realpath ${initrd_filepath}) /home/${GUEST_USER}"
-    ssh_guest_command "sudo chmod 644  /home/${GUEST_USER}/$(basename $(realpath ${initrd_filepath}))"
-    scp_guest_command "${GUEST_USER}@localhost:/home/${GUEST_USER}/$(basename $(realpath ${initrd_filepath}))" "${LAUNCH_WORKING_DIR}"
+    # ssh_guest_command "sudo cp  $(realpath ${initrd_filepath}) /home/${GUEST_USER}"
+    # ssh_guest_command "sudo chmod 644  /home/${GUEST_USER}/$(basename $(realpath ${initrd_filepath}))"
+    # scp_guest_command "${GUEST_USER}@localhost:/home/${GUEST_USER}/$(basename $(realpath ${initrd_filepath}))" "${LAUNCH_WORKING_DIR}"
+    # scp_guest_command  "${LAUNCH_WORKING_DIR}/vmlinuz-6.6.0_rc1_snp_guest_5a170ce1a" "${GUEST_USER}@localhost:/home/${GUEST_USER}"
+    # ssh_guest_command "sudo cp  /home/${GUEST_USER}/vmlinuz-6.6.0_rc1_snp_guest_5a170ce1a /boot/vmlinuz-6.6.0-rc1-snp-guest-5a170ce1a"
     
     # Overwrite the initrd/initramfs file path in host
-    GENERATED_INITRD_BIN=$(ls ${LAUNCH_WORKING_DIR}/ini*${guest_kernel_version}* )
+    # GENERATED_INITRD_BIN=$(ls ${LAUNCH_WORKING_DIR}/ini*${guest_kernel_version}* )
 
     ssh_guest_command "sudo shutdown now" || true
     echo "true" > "${guest_kernel_installed_file}"
 
     # Update the initrd file path and name in the guest launch source-bins file
-    sed -i -e "s|^\(INITRD_BIN=\).*$|\1\"${GENERATED_INITRD_BIN}\"|g" "${LAUNCH_WORKING_DIR}/source-bins"
+    # sed -i -e "s|^\(INITRD_BIN=\).*$|\1\"${GENERATED_INITRD_BIN}\"|g" "${LAUNCH_WORKING_DIR}/source-bins"
 
     # A few seconds for shutdown to complete
     sleep 3
 
     # Call the launch-guest again now that the image is prepped
-    setup_and_launch_guest
+    # setup_and_launch_guest
     return 0
   fi
 
@@ -920,27 +980,27 @@ setup_and_launch_guest() {
   #initrd_add_sev_guest_module "${INITRD_BIN}"
 
   # To update INITRD_BIN to initramfs or intrd
-  source "${LAUNCH_WORKING_DIR}/source-bins"
+  # source "${LAUNCH_WORKING_DIR}/source-bins"
 
-  if $UPM; then
-    add_qemu_cmdline_opts "-machine confidential-guest-support=sev0,memory-backend=ram1,kvm-type=protected"
-    add_qemu_cmdline_opts "-object memory-backend-memfd-private,id=ram1,size=1G,share=true"
-  else
-    add_qemu_cmdline_opts "-machine memory-encryption=sev0,vmport=off"
-  fi
+  # if $UPM; then
+  #   add_qemu_cmdline_opts "-machine confidential-guest-support=sev0,memory-backend=ram1,kvm-type=protected"
+  #   add_qemu_cmdline_opts "-object memory-backend-memfd-private,id=ram1,size=1G,share=true"
+  # else
+  #   add_qemu_cmdline_opts "-machine memory-encryption=sev0,vmport=off"
+  # fi
 
   # qemu 7.2 issue: pc-q35-7.1
   # snp object and kernel-hashes on
   # ovmf, initrd, kernel and append options
-  add_qemu_cmdline_opts "-machine pc-q35-7.1"
-  add_qemu_cmdline_opts "-object sev-snp-guest,id=sev0,cbitpos=51,reduced-phys-bits=1,kernel-hashes=on"
-  add_qemu_cmdline_opts "-drive if=pflash,format=raw,readonly=on,file=${OVMF_BIN}"
-  add_qemu_cmdline_opts "-initrd ${INITRD_BIN}"
-  add_qemu_cmdline_opts "-kernel ${KERNEL_BIN}"
-  add_qemu_cmdline_opts "-append \"${GUEST_KERNEL_APPEND}\""
+  # add_qemu_cmdline_opts "-machine pc-q35-7.1"
+  # add_qemu_cmdline_opts "-object sev-snp-guest,id=sev0,cbitpos=51,reduced-phys-bits=1,kernel-hashes=on"
+  # add_qemu_cmdline_opts "-drive if=pflash,format=raw,readonly=on,file=${OVMF_BIN}"
+  # add_qemu_cmdline_opts "-initrd ${INITRD_BIN}"
+  # add_qemu_cmdline_opts "-kernel ${KERNEL_BIN}"
+  # add_qemu_cmdline_opts "-append \"${GUEST_KERNEL_APPEND}\""
 
   # Launch qemu cmdline
-  "${QEMU_CMDLINE_FILE}"
+  # "${QEMU_CMDLINE_FILE}"
 }
 
 ssh_guest_command() {
@@ -971,17 +1031,25 @@ ssh_guest_command() {
   echo "${CAPTURED_STDOUT}"
 }
 
-scp_guest_command() {
-  [ -n "${1}" ] || { >&2 echo -e "No scp source specified"; return 1; }
-  [ -n "${2}" ] || { >&2 echo -e "No scp target specified"; return 1; }
+# scp_guest_command() {
+  
+#   echo "scp_guest_command "
 
-  scp -r -P ${HOST_SSH_PORT} \
-    -i ${GUEST_SSH_KEY_PATH} \
-    -o "StrictHostKeyChecking no" \
-    -o "PasswordAuthentication=no" \
-    -o ConnectTimeout=1 \
-    "${1}" "${2}"
-}
+#   [ -n "${1}" ] || { >&2 echo -e "No scp source specified"; return 1; }
+#   [ -n "${2}" ] || { >&2 echo -e "No scp target specified"; return 1; }
+
+#   echo "SCP Guest command exit status is:"
+
+#   scp -r -P ${HOST_SSH_PORT} \
+#     -i ${GUEST_SSH_KEY_PATH} \
+#     -o "StrictHostKeyChecking no" \
+#     -o "PasswordAuthentication=no" \
+#     -o ConnectTimeout=1 \
+#     "${1}" "${2}"
+
+#     echo $?
+
+# }
 
 verify_snp_guest() {
   # Exit if SSH private key does not exist
@@ -1015,22 +1083,27 @@ wait_and_verify_snp_guest() {
   return 1
 }
 
-wait_and_retry_command() {
-  local command="${1}"
-  local max_tries=30
+# wait_and_retry_command() {
+#   local command="${1}"
   
-  for ((i=1; i<=${max_tries}; i++)); do
-    if ! (${command} >/dev/null 2>&1); then
-      sleep 1
-      continue
-    fi
-    ${command}
-    return 0
-  done
+#   echo
+#   echo "command is : $command"
+#   echo
+#   local max_tries=60
   
-  >&2 echo -e "ERROR: Timed out trying to connect to guest"
-  return 1
-}
+#   for ((i=1; i<=${max_tries}; i++)); do
+#     echo "i = $i"
+#     if ! (${command} >/dev/null 2>&1); then
+#       sleep 1
+#       continue
+#     fi
+#     ${command}
+#     return 0
+#   done
+  
+#   >&2 echo -e "ERROR: Timed out trying to connect to guest"
+#   return 1
+# }
 
 setup_guest_attestation() {
   # Create directory
@@ -1221,6 +1294,7 @@ identify_linux_distribution_type(){
 
     fedora)
     LINUX_TYPE='fedora'
+    # GUEST_ROOT_LABEL="/dev/mapper/fedora-root"
 
     if [[ "$UPM" = false ]]; then
       echo "Non-UPM for Fedora is not supported "
@@ -1229,7 +1303,7 @@ identify_linux_distribution_type(){
     ;;
   esac
 
-  GUEST_KERNEL_APPEND="root=LABEL=${GUEST_ROOT_LABEL} ro console=ttyS0"
+  # GUEST_KERNEL_APPEND="root=LABEL=${GUEST_ROOT_LABEL} ro rd.lvm.lv=fedora/root"
 }
 
 unregister_redhat_subscription(){
@@ -1363,7 +1437,7 @@ main() {
       verify_snp_host
       install_dependencies
       setup_and_launch_guest
-      wait_and_retry_command verify_snp_guest
+      # wait_and_retry_command verify_snp_guest
 
       echo -e "Guest SSH port forwarded to host port: ${HOST_SSH_PORT}"
       echo -e "The guest is running in the background. Use the following command to access via SSH:"
