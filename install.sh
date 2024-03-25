@@ -15,7 +15,8 @@ fi
 if [ "$ID" = "debian" ] || [ "$ID_LIKE" = "debian" ]; then
 	dpkg -i linux/host/linux-image-*.deb
 else
-	dnf install -y linux/host/kernel-*.rpm
+	latest_host_kernel_package=$(ls -t linux/host/kernel-*| grep -v "devel" | grep -v "headers" | head -1)
+	dnf install -y $latest_host_kernel_package
 	#dnf install -y linux/kernel-[0-9]*host*.rpm
 fi
 
